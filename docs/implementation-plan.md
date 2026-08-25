@@ -268,7 +268,47 @@ found across two rounds of live testing on a real desktop session:
    above 1080p** - not just for speed, but because a debug build can
    make the tool's own Ctrl-C handling sluggish enough to look hung.
 
-### 5. Polish - not yet done
+### 5. Desktop audio capture - done (`prtsc/src/recording.rs`)
+`record [--audio]` (and MCP `start_recording`'s `audio` parameter) adds
+a second, AAC-encoded (`fdk-aac`) track sourced from the *default
+sink's monitor* - "what's currently playing," not the microphone. A
+direct, unsandboxed PipeWire connection (`ContextRc::new` +
+`connect_rc(None)` to the default socket, `STREAM_CAPTURE_SINK =>
+"true"`) rather than the portal-scoped one video uses, since desktop
+audio isn't portal-gated at all. Runs on the same thread/main loop as
+video via its own `StreamRc` (kept alive by its own `CoreRc`/`ContextRc`
+internally - no lifetime tying it to a caller-held reference, unlike
+video's `StreamBox`), muxed into the same MP4 via lazily assigned,
+independently-tracked track ids (`Mp4Writer::add_track` has no getter
+to read its own id counter back).
+
+**Verified the stop path doesn't leak the PipeWire node.** Prompted by
+a suspicion (raised after real-desktop testing) that recording might be
+"leaving the microphone on" - i.e. the capture stream still visibly
+active after `stop_recording`/Ctrl-C. Isolated the audio stream's
+connect -> quit-the-loop -> drop(stream/core/context) sequence in a
+standalone repro binary and watched it via `pw-dump` while keeping the
+*owning process* alive afterward (mimicking the long-lived MCP server,
+where nothing closes the socket by process exit) - the node
+disappeared from the graph within about a second of "stop," well before
+the process itself did anything else. So the "quit the main loop, then
+drop everything" pattern this codebase already uses for the stop path
+(see the start/stop lifecycle section above) does cleanly release the
+audio stream; it's not a resource leak in our code.
+
+What *is* real: GNOME Shell's microphone privacy indicator lights up
+for **any** active PipeWire audio capture stream, not just ones reading
+an actual microphone device - it doesn't distinguish a sink-monitor
+("desktop audio") capture from a real mic input, a known, acknowledged
+gap in GNOME Shell's own filtering (it should exclude "virtual"
+captures based on what they're actually attached to, but doesn't).
+`--audio` will visibly trigger that indicator while recording even
+though it never touches the mic, and it should still clear promptly on
+stop per the `pw-dump` finding above - if it visibly lingers longer
+than that, it's the shell's own indicator refresh/polling, not our
+stream still being connected.
+
+### 6. Polish - not yet done
 - Handle portal cancellation cleanly (same error-surfacing pattern
   `capture` already has) - `screencast::negotiate` does return `Err` on
   failure already, but the "user closed the picker without choosing
