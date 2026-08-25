@@ -1,8 +1,8 @@
 //! A screen capture/recording CLI tool built on the XDG Desktop Portal:
 //! `prtsc` with no arguments captures a screenshot once and prints the
-//! saved location, `prtsc record [path]` records a screencast until
-//! Ctrl-C, and `prtsc mcp` exposes the capture action as an MCP tool over
-//! stdio.
+//! saved location, `prtsc record [--audio] [path]` records a screencast
+//! (optionally with desktop audio) until Ctrl-C, and `prtsc mcp` exposes
+//! the capture/recording actions as MCP tools over stdio.
 #![warn(missing_docs)]
 
 mod capture;
@@ -39,9 +39,25 @@ async fn run_async() {
                 std::process::exit(1);
             }
         }
-        Some("record") => record(args.next()).await,
+        Some("record") => {
+            let mut audio = false;
+            let mut path = None;
+            for arg in args {
+                if arg == "--audio" {
+                    audio = true;
+                } else if path.is_none() {
+                    path = Some(arg);
+                } else {
+                    eprintln!("unexpected argument: {arg}");
+                    std::process::exit(2);
+                }
+            }
+            record(path, audio).await
+        }
         Some(other) => {
-            eprintln!("unknown argument: {other} (expected no arguments, `mcp`, or `record`)");
+            eprintln!(
+                "unknown argument: {other} (expected no arguments, `mcp`, or `record [--audio] [path]`)"
+            );
             std::process::exit(2);
         }
     }
@@ -57,7 +73,7 @@ async fn capture_once() {
     }
 }
 
-async fn record(output: Option<String>) {
+async fn record(output: Option<String>, audio: bool) {
     let output = output.unwrap_or_else(|| "recording.mp4".to_string());
 
     let session = match screencast::negotiate().await {
@@ -89,6 +105,7 @@ async fn record(output: Option<String>) {
                 session.node_id,
                 session.size,
                 &thread_path,
+                audio,
                 stop_rx,
             )
         })

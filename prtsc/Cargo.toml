@@ -19,3 +19,4 @@ mp4 = "0.14.0"
 openh264 = { version = "0.9.8", features = ["source"] }
 pipewire = { version = "0.10.1", features = ["v1_0_0"] }
 serde = { version = "1.0.229", features = ["derive"] }
+fdk-aac = "0.8.0"

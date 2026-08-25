@@ -30,6 +30,9 @@ struct StartRecordingRequest {
     /// Output file path. Defaults to `recording.mp4` in the working
     /// directory if omitted.
     path: Option<String>,
+    /// Also capture desktop audio (the default sink's monitor) as a second
+    /// track. Defaults to false (video only) if omitted.
+    audio: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -59,15 +62,18 @@ impl CaptureServer {
     }
 
     #[tool(
-        description = "Start recording a screencast via the system's screen-share picker. \
-                        Blocks until the user completes that picker and recording has \
-                        actually begun. Call stop_recording to finish and get the saved \
-                        file's location - only one recording can be in progress at a time."
+        description = "Start recording a screencast via the system's screen-share picker, \
+                        optionally with desktop audio (the default sink's monitor) as a \
+                        second track. Blocks until the user completes that picker and \
+                        recording has actually begun. Call stop_recording to finish and get \
+                        the saved file's location - only one recording can be in progress \
+                        at a time."
     )]
     async fn start_recording(
         &self,
-        Parameters(StartRecordingRequest { path }): Parameters<StartRecordingRequest>,
+        Parameters(StartRecordingRequest { path, audio }): Parameters<StartRecordingRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let audio = audio.unwrap_or(false);
         if self.recording.lock().unwrap().is_some() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "a recording is already in progress - call stop_recording first",
@@ -97,6 +103,7 @@ impl CaptureServer {
                     session.node_id,
                     session.size,
                     &thread_path,
+                    audio,
                     stop_rx,
                 )
             }) {

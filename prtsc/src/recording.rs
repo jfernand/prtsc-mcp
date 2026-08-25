@@ -1,6 +1,9 @@
-//! Captures a PipeWire video stream (negotiated via [`crate::screencast`]),
-//! encodes it with `openh264`, and muxes it to MP4 - all on one dedicated
-//! thread, since PipeWire's mainloop is blocking, not async.
+//! Captures PipeWire video (negotiated via [`crate::screencast`]) and,
+//! optionally, desktop audio (a direct, non-portal-gated connection to the
+//! default sink's monitor - `prtsc` isn't sandboxed, so no permission gate
+//! applies), encodes them with `openh264`/`fdk-aac`, and muxes both to one
+//! MP4 - all on one dedicated thread, since PipeWire's mainloop is
+//! blocking, not async.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -9,11 +12,13 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use mp4::{AvcConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
+use fdk_aac::enc as aac;
+use mp4::{AacConfig, AvcConfig, ChannelConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
 use openh264::OpenH264API;
 use openh264::encoder::{Encoder, EncoderConfig};
 use openh264::formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer};
 use pipewire as pw;
+use pw::spa::param::audio::AudioFormat;
 use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
 use pw::spa::pod::serialize::PodSerializer;
@@ -21,13 +26,23 @@ use pw::spa::pod::{Pod, Value, object, property};
 use pw::spa::utils::{Direction, SpaTypes};
 use pw::stream::StreamFlags;
 
-/// MP4 track id for our (only, video) track.
-const TRACK_ID: u32 = 1;
 /// MP4 timescale: units per second used for sample timestamps/durations.
 const TIMESCALE: u32 = 1000;
-/// Minimum time between processed frames (see the `process` callback for
-/// why this matters beyond just capping the output frame rate).
+/// Minimum time between processed video frames (see the video `process`
+/// callback for why this matters beyond just capping the output frame
+/// rate).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / 30);
+/// Audio sample rate requested from PipeWire and configured on the AAC
+/// encoder - PipeWire's internal graph commonly already runs at 48kHz, so
+/// this avoids relying on PipeWire's own (unverified, for our purposes)
+/// resampling.
+const AUDIO_SAMPLE_RATE: u32 = 48000;
+/// Fixed at stereo - matches typical desktop audio, and the `fdk-aac`
+/// binding's `Encoder` is hardcoded to allocate 2 channels internally
+/// regardless of `ChannelMode` (see its own source).
+const AUDIO_CHANNELS: u32 = 2;
+/// AAC-LC encodes exactly this many samples *per channel* per frame.
+const AAC_FRAME_SAMPLES: usize = 1024;
 
 /// Which interleaved pixel layout PipeWire negotiated - both map directly
 /// onto an `openh264` slice-wrapper type, so no manual RGB/BGR channel
@@ -38,19 +53,42 @@ enum PixelLayout {
     Rgba,
 }
 
-/// Mutable state shared between the `param_changed` and `process`
-/// callbacks. Both run on the PipeWire mainloop thread, so a plain
-/// `RefCell` (no `Mutex`) is enough.
+/// Mutable state shared between the video and (optional) audio streams'
+/// `param_changed`/`process` callbacks. All of it - both streams included -
+/// runs on the single PipeWire mainloop thread, so a plain `RefCell` (no
+/// `Mutex`) is enough.
 struct EncodeState {
     writer: Mp4Writer<File>,
+    /// `Mp4Writer::add_track` assigns ids sequentially starting at 1, with
+    /// no getter to read that count back - tracked here instead so video's
+    /// and audio's tracks (added lazily, independently, in whichever order
+    /// their first usable data happens to arrive) each get a stable,
+    /// correct id to write samples against afterward.
+    next_track_id: u32,
+    /// Wall-clock start of the recording, set by whichever of video/audio
+    /// starts first - both compute their own per-sample timestamps as
+    /// elapsed time since this.
+    start: Option<Instant>,
+    error: Option<String>,
+
     encoder: Encoder,
     layout: Option<PixelLayout>,
     size: (usize, usize),
-    track_added: bool,
-    start: Option<Instant>,
+    video_track_id: Option<u32>,
     last_frame_at: Option<Instant>,
     frame_count: u32,
-    error: Option<String>,
+
+    audio: Option<AudioState>,
+}
+
+/// Audio-specific encode state, present only when `--audio` was requested.
+struct AudioState {
+    encoder: aac::Encoder,
+    track_id: Option<u32>,
+    /// Interleaved S16LE samples accumulated from `process` until there's
+    /// enough for one AAC frame (`AAC_FRAME_SAMPLES` per channel).
+    pcm: Vec<i16>,
+    frame_count: u32,
 }
 
 /// Sent through a [`pipewire::channel`] to stop a running [`record`] call
@@ -70,6 +108,7 @@ pub fn record(
     node_id: u32,
     size: (i32, i32),
     output: &Path,
+    audio: bool,
     stop_rx: pw::channel::Receiver<Terminate>,
 ) -> Result<(), String> {
     pw::init();
@@ -107,16 +146,37 @@ pub fn record(
     let encoder_config = EncoderConfig::new();
     let encoder = Encoder::with_api_config(api, encoder_config).map_err(|err| err.to_string())?;
 
+    let audio_state = if audio {
+        let encoder = aac::Encoder::new(aac::EncoderParams {
+            bit_rate: aac::BitRate::Cbr(128_000),
+            sample_rate: AUDIO_SAMPLE_RATE,
+            transport: aac::Transport::Raw,
+            channels: aac::ChannelMode::Stereo,
+            audio_object_type: aac::AudioObjectType::Mpeg4LowComplexity,
+        })
+        .map_err(|err| format!("failed to create AAC encoder: {err}"))?;
+        Some(AudioState {
+            encoder,
+            track_id: None,
+            pcm: Vec::new(),
+            frame_count: 0,
+        })
+    } else {
+        None
+    };
+
     let state = Rc::new(RefCell::new(EncodeState {
         writer,
+        next_track_id: 1,
+        start: None,
+        error: None,
         encoder,
         layout: None,
         size: (size.0.max(0) as usize, size.1.max(0) as usize),
-        track_added: false,
-        start: None,
+        video_track_id: None,
         last_frame_at: None,
         frame_count: 0,
-        error: None,
+        audio: audio_state,
     }));
 
     let stream = pw::stream::StreamBox::new(
@@ -198,7 +258,7 @@ pub fn record(
         .register()
         .map_err(|err| err.to_string())?;
 
-    let values = enum_format_pod(size)?;
+    let values = video_format_pod(size)?;
     let format_pod = Pod::from_bytes(&values).ok_or("failed to build format pod")?;
     let mut params = [format_pod];
     stream
@@ -210,13 +270,93 @@ pub fn record(
         )
         .map_err(|err| err.to_string())?;
 
+    // Audio isn't gated by the portal at all - a direct, unsandboxed
+    // connection to the *default* PipeWire socket (no fd from the
+    // screencast session) rather than the portal-scoped one video uses.
+    // Kept on its own Context/Core so a failure connecting for audio can't
+    // affect the video stream, but attached to the same main_loop so one
+    // thread/event loop (and one Terminate listener) covers both.
+    //
+    // Uses `StreamRc` rather than video's `StreamBox`: `StreamRc::new`
+    // takes an *owned* `CoreRc` and keeps it alive internally, with no
+    // lifetime tying the stream to a caller-held reference - `StreamBox`
+    // borrows its `Core` instead, which doesn't work here since this
+    // stream/listener pair is built inside an `if` and needs to outlive
+    // that block.
+    let _audio = if audio {
+        let audio_context =
+            pw::context::ContextRc::new(&main_loop, None).map_err(|err| err.to_string())?;
+        let audio_core = audio_context
+            .connect_rc(None)
+            .map_err(|err| err.to_string())?;
+        let audio_stream = pw::stream::StreamRc::new(
+            audio_core,
+            "prtsc-record-audio",
+            pw::properties::properties! {
+                *pw::keys::MEDIA_TYPE => "Audio",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Production",
+                // Route to the default sink's monitor (i.e. "what's
+                // currently playing") rather than a microphone input -
+                // this is the standard PipeWire idiom for desktop-audio
+                // capture (same property `pw-record --target
+                // @DEFAULT_SINK@` relies on).
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
+            },
+        )
+        .map_err(|err| err.to_string())?;
+
+        let audio_process_state = state.clone();
+        let audio_listener = audio_stream
+            .add_local_listener_with_user_data(pw::spa::param::audio::AudioInfoRaw::default())
+            .param_changed(|_stream, _format, _id, _param| {})
+            .process(move |stream, _| {
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    return;
+                };
+                let datas = buffer.datas_mut();
+                let Some(data) = datas.first_mut() else {
+                    return;
+                };
+                let Some(bytes) = data.data() else { return };
+
+                let mut state = audio_process_state.borrow_mut();
+                if state.error.is_some() {
+                    return;
+                }
+                if let Err(err) = encode_audio(&mut state, bytes) {
+                    state.error = Some(err);
+                }
+            })
+            .register()
+            .map_err(|err| err.to_string())?;
+
+        let values = audio_format_pod()?;
+        let format_pod = Pod::from_bytes(&values).ok_or("failed to build audio format pod")?;
+        let mut params = [format_pod];
+        audio_stream
+            .connect(
+                Direction::Input,
+                None,
+                StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+                &mut params,
+            )
+            .map_err(|err| err.to_string())?;
+
+        Some((audio_stream, audio_listener))
+    } else {
+        None
+    };
+
     main_loop.run();
 
-    // Both callbacks above hold their own `Rc` clone of `state` for as long
-    // as `_listener` is alive; drop it (and `stream`, which owns it) first
-    // so `Rc::into_inner` below actually sees a unique reference.
+    // All the callbacks above hold their own `Rc` clone of `state` for as
+    // long as their listener is alive; drop all of them (and the streams,
+    // which own them) first so `Rc::into_inner` below actually sees a
+    // unique reference.
     drop(_listener);
     drop(stream);
+    drop(_audio);
 
     let state = Rc::into_inner(state)
         .ok_or("encoder state still referenced after main loop exited")?
@@ -232,8 +372,12 @@ pub fn record(
         .map(|meta| meta.len())
         .unwrap_or(0);
     let (width, height) = state.size;
+    let audio_note = match state.audio {
+        Some(audio) => format!(", {} audio frames", audio.frame_count),
+        None => String::new(),
+    };
     eprintln!(
-        "Wrote {} frames, {width}x{height}, {:.1}s, {:.1} KiB -> {}",
+        "Wrote {} frames, {width}x{height}, {:.1}s, {:.1} KiB{audio_note} -> {}",
         state.frame_count,
         duration.as_secs_f64(),
         file_size as f64 / 1024.0,
@@ -246,7 +390,7 @@ pub fn record(
 /// Builds an SPA `EnumFormat` pod offering the pixel layouts `openh264` can
 /// consume directly (`BgraSliceU8`/`RgbaSliceU8`), fixed at the portal's
 /// reported stream size - PipeWire negotiates down to one of these.
-fn enum_format_pod(size: (i32, i32)) -> Result<Vec<u8>, String> {
+fn video_format_pod(size: (i32, i32)) -> Result<Vec<u8>, String> {
     let obj = object!(
         SpaTypes::ObjectParamFormat,
         pw::spa::param::ParamType::EnumFormat,
@@ -291,6 +435,26 @@ fn enum_format_pod(size: (i32, i32)) -> Result<Vec<u8>, String> {
     );
     let values = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
         .map_err(|err| format!("failed to serialize format pod: {err:?}"))?
+        .0
+        .into_inner();
+    Ok(values)
+}
+
+/// Builds an SPA `EnumFormat` pod for raw interleaved S16LE audio at
+/// [`AUDIO_SAMPLE_RATE`]/[`AUDIO_CHANNELS`] - fixed values, not a `Choice`
+/// range, since that's exactly what the AAC encoder is configured for.
+fn audio_format_pod() -> Result<Vec<u8>, String> {
+    let obj = object!(
+        SpaTypes::ObjectParamFormat,
+        pw::spa::param::ParamType::EnumFormat,
+        property!(FormatProperties::MediaType, Id, MediaType::Audio),
+        property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        property!(FormatProperties::AudioFormat, Id, AudioFormat::S16LE),
+        property!(FormatProperties::AudioRate, Int, AUDIO_SAMPLE_RATE as i32),
+        property!(FormatProperties::AudioChannels, Int, AUDIO_CHANNELS as i32),
+    );
+    let values = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .map_err(|err| format!("failed to serialize audio format pod: {err:?}"))?
         .0
         .into_inner();
     Ok(values)
@@ -347,7 +511,7 @@ fn encode_frame(
         }
     }
 
-    if !state.track_added {
+    if state.video_track_id.is_none() {
         let (Some(sps), Some(pps)) = (sps, pps) else {
             // No parameter sets yet (shouldn't happen on the first frame,
             // but nothing to mux until they arrive).
@@ -363,8 +527,8 @@ fn encode_frame(
             .writer
             .add_track(&TrackConfig::from(avc_config))
             .map_err(|err| err.to_string())?;
-        state.track_added = true;
-        state.start = Some(Instant::now());
+        state.video_track_id = Some(state.next_track_id);
+        state.next_track_id += 1;
     }
 
     if sample_bytes.is_empty() {
@@ -373,10 +537,11 @@ fn encode_frame(
     let start = *state.start.get_or_insert_with(Instant::now);
     let start_time = start.elapsed().as_millis() as u64;
     let is_sync = bitstream.frame_type() == openh264::encoder::FrameType::IDR;
+    let track_id = state.video_track_id.expect("set above");
     state
         .writer
         .write_sample(
-            TRACK_ID,
+            track_id,
             &Mp4Sample {
                 start_time,
                 duration: 0,
@@ -387,6 +552,101 @@ fn encode_frame(
         )
         .map_err(|err| err.to_string())?;
     state.frame_count += 1;
+
+    Ok(())
+}
+
+/// Accumulates interleaved S16LE PCM samples from one PipeWire audio
+/// buffer, encoding complete AAC frames (`AAC_FRAME_SAMPLES` per channel)
+/// as they become available, then muxes each one. Leftover samples
+/// smaller than a full frame stay buffered for the next call.
+fn encode_audio(state: &mut EncodeState, bytes: &[u8]) -> Result<(), String> {
+    if state.audio.is_none() {
+        return Ok(());
+    }
+
+    // Drain complete AAC frames into owned buffers first, scoping the
+    // `state.audio` borrow tightly to just this block - muxing each frame
+    // afterward needs sibling fields (`writer`, `next_track_id`, `start`)
+    // on the same `state`, which a borrow held across this whole function
+    // would conflict with.
+    let mut encoded_frames = Vec::new();
+    {
+        let audio = state.audio.as_mut().expect("checked above");
+        // SAFETY-free: reinterpret raw S16LE bytes as i16 samples by
+        // pairing adjacent bytes, rather than an unaligned cast - `bytes`
+        // comes from a PipeWire buffer with no alignment guarantee.
+        audio.pcm.extend(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| i16::from_le_bytes(*pair)),
+        );
+
+        let frame_len = AAC_FRAME_SAMPLES * AUDIO_CHANNELS as usize;
+        let mut output = [0u8; 4096];
+        while audio.pcm.len() >= frame_len {
+            let info = audio
+                .encoder
+                .encode(&audio.pcm[..frame_len], &mut output)
+                .map_err(|err| format!("AAC encode failed: {err}"))?;
+            audio.pcm.drain(..frame_len);
+            if info.output_size > 0 {
+                encoded_frames.push(output[..info.output_size].to_vec());
+            }
+            // A zero-length output means the encoder is still filling its
+            // internal look-ahead buffer before emitting a first frame -
+            // nothing to write yet, just keep feeding it.
+        }
+    }
+
+    for frame in encoded_frames {
+        if state
+            .audio
+            .as_ref()
+            .expect("checked above")
+            .track_id
+            .is_none()
+        {
+            let aac_config = AacConfig {
+                bitrate: 128_000,
+                profile: mp4::AudioObjectType::AacLowComplexity,
+                freq_index: mp4::SampleFreqIndex::Freq48000,
+                chan_conf: ChannelConfig::Stereo,
+            };
+            state
+                .writer
+                .add_track(&TrackConfig::from(aac_config))
+                .map_err(|err| err.to_string())?;
+            let track_id = state.next_track_id;
+            state.next_track_id += 1;
+            state.audio.as_mut().expect("checked above").track_id = Some(track_id);
+        }
+
+        let start = *state.start.get_or_insert_with(Instant::now);
+        let start_time = start.elapsed().as_millis() as u64;
+        let track_id = state
+            .audio
+            .as_ref()
+            .expect("checked above")
+            .track_id
+            .expect("set above");
+        state
+            .writer
+            .write_sample(
+                track_id,
+                &Mp4Sample {
+                    start_time,
+                    duration: 0,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: frame.into(),
+                },
+            )
+            .map_err(|err| err.to_string())?;
+        state.audio.as_mut().expect("checked above").frame_count += 1;
+    }
 
     Ok(())
 }
@@ -452,14 +712,16 @@ mod tests {
 
         let mut state = EncodeState {
             writer,
+            next_track_id: 1,
+            start: None,
+            error: None,
             encoder,
             layout: Some(PixelLayout::Bgra),
             size: (WIDTH, HEIGHT),
-            track_added: false,
-            start: None,
+            video_track_id: None,
             last_frame_at: None,
             frame_count: 0,
-            error: None,
+            audio: None,
         };
 
         for frame in 0..FRAME_COUNT {
@@ -471,7 +733,10 @@ mod tests {
             encode_frame(&mut state, PixelLayout::Bgra, WIDTH * 4, &pixels).expect("encode_frame");
         }
 
-        assert!(state.track_added, "no track was added - SPS/PPS never seen");
+        assert!(
+            state.video_track_id.is_some(),
+            "no track was added - SPS/PPS never seen"
+        );
         state.writer.write_end().expect("write_end");
 
         let file = std::fs::File::open(&path).expect("reopen mp4");
