@@ -334,16 +334,19 @@ two stages:
    server mode added alongside it for programmatic/agent use.
 
 The `winit`/`softbuffer`/`fontdue`/`ratatui` rendering layer itself still
-exists, unused for now, in the separate `softbuffer-backend` crate (see its
-own history below) - parked for a possible future interactive/TUI mode, not
-deleted.
+exists, unused for now, as its own standalone crate at
+`../rust-projects/softbuffer-backend` (moved out of this repo's workspace,
+full history preserved via `git filter-repo` - see its own history below) -
+parked for a possible future interactive/TUI mode, not deleted.
 
-## `softbuffer-backend` crate history (parked, not currently used by `prtsc`)
+## `softbuffer-backend` crate history (parked, not currently used by `prtsc`, now its own repo)
 
 The steps below built the `softbuffer-backend` crate: a `ratatui` `Backend`
 that renders directly into a `winit` window via `softbuffer` and `fontdue`,
 with no external terminal emulator involved. The crate still builds and
-works standalone; `prtsc` just doesn't depend on it right now.
+works standalone; it now lives in its own repo at
+`../rust-projects/softbuffer-backend` rather than as a `prtsc` workspace
+member, since `prtsc` doesn't depend on it.
 
 ### 1. Bare window
 Add `winit` and `softbuffer`. Open a window, run the event loop, fill the
