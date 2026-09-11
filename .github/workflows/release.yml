@@ -1,0 +1,84 @@
+name: Release
+
+# Trunk-based development has no release branches -- a release is just a
+# tag on whatever commit on main is ready to ship. Tag pattern requires a
+# semver-ish version (v1.2.3, v1.2.3-rc.1, ...); anything else (branches,
+# ad-hoc tags) is ignored. Note: GitHub's tag-filter syntax is a limited
+# glob, not regex -- `[0-9]` character classes work, but `+`/`{}`
+# quantifiers don't (they'd match literally). check-version below is the
+# real correctness gate; this pattern only needs to be roughly right.
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Belt-and-suspenders: CI already gated whatever commit this tag points
+  # at when it landed on main, but re-run the full test suite against the
+  # exact tagged commit before building anything to release.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev
+      - run: cargo test --locked --verbose
+
+  # The tag is the single source of truth for the release version; make
+  # sure Cargo.toml agrees with it before anything gets built and
+  # published under a version number that doesn't match the crate itself.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag must match Cargo.toml's version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (version $tag_version) does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+  # Publish the crate itself to crates.io. `cargo publish` re-verifies the
+  # package builds from a clean extraction before uploading, so this also
+  # doubles as a last correctness check on exactly what will ship.
+  publish:
+    needs: [test, check-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev
+      - name: Publish to crates.io
+        working-directory: prtsc
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # `prtsc-mcp` ships a `prtsc` binary, not just a library -- cut the GitHub
+  # release off the tagged commit once the crate itself is published.
+  release:
+    needs: [test, check-version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          generate_release_notes: true

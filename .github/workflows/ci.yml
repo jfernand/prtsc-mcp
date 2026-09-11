@@ -1,0 +1,48 @@
+name: CI
+
+# Trunk-based development: master is the only long-lived branch, so this
+# runs on every push that lands on it (direct pushes and merged PRs alike)
+# plus every pull request targeting it, so nothing reaches trunk unchecked.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# Superseding pushes to the same branch/PR cancel their in-flight run
+# instead of queuing behind it -- keeps feedback fast for frequent,
+# small trunk-based commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Test
+        run: cargo test --locked --verbose
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings

@@ -845,7 +845,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "prtsc"
+name = "prtsc-mcp"
 version = "0.1.0"
 dependencies = [
  "ashpd",

@@ -1,10 +1,14 @@
 [package]
-name = "prtsc"
+name = "prtsc-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Screen capture/recording CLI (and MCP server) driven by the XDG Desktop Portal"
+repository = "https://github.com/jfernand/prtsc-mcp"
+
+[lib]
+name = "prtsc"
 
 [[bin]]
 name = "prtsc"
