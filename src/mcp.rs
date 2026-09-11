@@ -4,9 +4,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::transport::stdio;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt, schemars, serde, tool, tool_handler,
@@ -37,7 +36,6 @@ struct StartRecordingRequest {
 
 #[derive(Clone)]
 struct CaptureServer {
-    tool_router: ToolRouter<Self>,
     /// At most one recording in flight at a time - `None` when idle.
     recording: Arc<Mutex<Option<RecordingHandle>>>,
 }
@@ -46,7 +44,6 @@ struct CaptureServer {
 impl CaptureServer {
     fn new() -> Self {
         Self {
-            tool_router: Self::tool_router(),
             recording: Arc::new(Mutex::new(None)),
         }
     }
@@ -56,8 +53,8 @@ impl CaptureServer {
     )]
     async fn capture(&self) -> Result<CallToolResult, McpError> {
         match capture::capture().await {
-            Ok(uri) => Ok(CallToolResult::success(vec![Content::text(uri)])),
-            Err(err) => Ok(CallToolResult::error(vec![Content::text(err)])),
+            Ok(uri) => Ok(CallToolResult::success(vec![ContentBlock::text(uri)])),
+            Err(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
         }
     }
 
@@ -75,7 +72,7 @@ impl CaptureServer {
     ) -> Result<CallToolResult, McpError> {
         let audio = audio.unwrap_or(false);
         if self.recording.lock().unwrap().is_some() {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "a recording is already in progress - call stop_recording first",
             )]));
         }
@@ -83,7 +80,7 @@ impl CaptureServer {
         let session = match screencast::negotiate().await {
             Ok(session) => session,
             Err(err) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "recording setup failed: {err}"
                 ))]));
             }
@@ -109,7 +106,7 @@ impl CaptureServer {
             }) {
             Ok(handle) => handle,
             Err(err) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "failed to spawn recording thread: {err}"
                 ))]));
             }
@@ -119,7 +116,7 @@ impl CaptureServer {
 
         let message = format!("Recording started: {}", path.display());
         *self.recording.lock().unwrap() = Some(RecordingHandle { sender, task, path });
-        Ok(CallToolResult::success(vec![Content::text(message)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
 
     #[tool(
@@ -128,35 +125,32 @@ impl CaptureServer {
     )]
     async fn stop_recording(&self) -> Result<CallToolResult, McpError> {
         let Some(handle) = self.recording.lock().unwrap().take() else {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "no recording in progress",
             )]));
         };
         let _ = handle.sender.send(Terminate);
         match handle.task.await.expect("recording thread panicked") {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 handle.path.display().to_string(),
             )])),
-            Err(err) => Ok(CallToolResult::error(vec![Content::text(err)])),
+            Err(err) => Ok(CallToolResult::error(vec![ContentBlock::text(err)])),
         }
     }
 }
 
-#[tool_handler]
-impl ServerHandler for CaptureServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Exposes tools to initiate a screen capture via the system's screenshot \
-                 portal, and to start/stop recording a screencast via the system's \
-                 screen-share portal."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
-    }
-}
+// `name` must be given explicitly: with neither `name` nor `version` set,
+// the macro falls back to `Implementation::from_build_env()`, a function
+// defined inside the `rmcp` crate itself - its `env!("CARGO_PKG_NAME")`
+// bakes in *rmcp's* package name at *rmcp's* build time, not ours, so the
+// server would otherwise report itself as "rmcp" during initialize.
+#[tool_handler(
+    name = "prtsc",
+    instructions = "Exposes tools to initiate a screen capture via the system's screenshot \
+                    portal, and to start/stop recording a screencast via the system's \
+                    screen-share portal."
+)]
+impl ServerHandler for CaptureServer {}
 
 /// Runs the MCP server over stdio until the client disconnects.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
