@@ -1,9 +1,27 @@
-[workspace]
-resolver = "3"
-members = ["prtsc"]
-
-[workspace.package]
+[package]
+name = "prtsc-mcp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
+description = "Screen capture/recording CLI (and MCP server) driven by the XDG Desktop Portal"
+repository = "https://github.com/jfernand/prtsc-mcp"
+readme = "README.md"
+
+[lib]
+name = "prtsc"
+
+[[bin]]
+name = "prtsc"
+path = "src/bin/prtsc.rs"
+
+[dependencies]
+ashpd = { version = "0.13.13", features = ["screenshot", "screencast"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-std", "signal"] }
+rmcp = { version = "0.13", features = ["server", "macros", "transport-io"] }
+serde_json = "1.0.151"
+mp4 = "0.14.0"
+openh264 = { version = "0.9.8", features = ["source"] }
+pipewire = { version = "0.10.1", features = ["v1_0_0"] }
+serde = { version = "1.0.229", features = ["derive"] }
+fdk-aac = "0.8.0"

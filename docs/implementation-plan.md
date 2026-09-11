@@ -78,7 +78,7 @@ just a library call. The `mp4` crate is pure Rust (no C/C++ dependency at
 all, unlike the earlier `webm` crate, which was FFI bindings to Google's
 `libwebm` C++ library).
 
-### 1. Portal session negotiation - done (`prtsc/src/screencast.rs`)
+### 1. Portal session negotiation - done (`src/screencast.rs`)
 `Screencast::new()` -> `create_session()` -> `select_sources(session,
 SelectSourcesOptions)` -> `start(session, None, ..)` returns `Streams`,
 each with a `pipe_wire_node_id()` and size. `open_pipe_wire_remote(session,
@@ -94,7 +94,7 @@ the human user completed the picker directly). Produced a real, playable
 1920x1080 H.264/MP4 recording - confirmed with `ffprobe`, a full
 `ffmpeg` decode, and by extracting and viewing an actual captured frame.
 
-### 2. Raw frame capture + encode on one dedicated thread - done (`prtsc/src/recording.rs`)
+### 2. Raw frame capture + encode on one dedicated thread - done (`src/recording.rs`)
 Simplified from the original plan: encoding happens directly inside
 PipeWire's `process` callback, on the same thread as its mainloop,
 rather than forwarding frames over a channel to a separate encoder
@@ -268,7 +268,7 @@ found across two rounds of live testing on a real desktop session:
    above 1080p** - not just for speed, but because a debug build can
    make the tool's own Ctrl-C handling sluggish enough to look hung.
 
-### 5. Desktop audio capture - done (`prtsc/src/recording.rs`)
+### 5. Desktop audio capture - done (`src/recording.rs`)
 `record [--audio]` (and MCP `start_recording`'s `audio` parameter) adds
 a second, AAC-encoded (`fdk-aac`) track sourced from the *default
 sink's monitor* - "what's currently playing," not the microphone. A
